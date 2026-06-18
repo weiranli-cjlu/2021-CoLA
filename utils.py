@@ -1,13 +1,16 @@
 import os
 import random
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import scipy.io as sio
 import scipy.sparse as sp
 import torch
 from torch import Tensor
-from torch_geometric.utils import sort_edge_index
+try:
+    from torch_geometric.utils import sort_edge_index
+except ImportError:
+    sort_edge_index = None
 
 
 def sparse_to_tuple(sparse_mx, insert_batch=False):
@@ -26,15 +29,12 @@ def sparse_to_tuple(sparse_mx, insert_batch=False):
         return coords, values, shape
 
     if isinstance(sparse_mx, list):
-        for i in range(len(sparse_mx)):
-            sparse_mx[i] = to_tuple(sparse_mx[i])
-    else:
-        sparse_mx = to_tuple(sparse_mx)
-    return sparse_mx
+        return [to_tuple(mx) for mx in sparse_mx]
+    return to_tuple(sparse_mx)
 
 
 def preprocess_features(features):
-    """Row-normalize feature matrix and convert to tuple representation."""
+    """Row-normalize feature matrix."""
     rowsum = np.array(features.sum(1))
     r_inv = np.power(rowsum, -1).flatten()
     r_inv[np.isinf(r_inv)] = 0.0
@@ -65,17 +65,21 @@ def dense_to_one_hot(labels_dense, num_classes):
 def load_mat(dataset, train_rate=0.3, val_rate=0.1, data_dir="~/datasets/GAD/mat"):
     """Load .mat dataset."""
     data = sio.loadmat(f"{os.path.expanduser(data_dir)}/{dataset}")
-    label = data["Label"] if ("Label" in data) else data["gnd"]
-    attr = data["Attributes"] if ("Attributes" in data) else data["X"]
-    network = data["Network"] if ("Network" in data) else data["A"]
+    label = data["Label"] if "Label" in data else data["gnd"]
+    attr = data["Attributes"] if "Attributes" in data else data["X"]
+    network = data["Network"] if "Network" in data else data["A"]
 
     adj = sp.csr_matrix(network)
     feat = sp.lil_matrix(attr)
-    labels = np.squeeze(np.array(data["Class"], dtype=np.int64) - 1)
-    num_classes = np.max(labels) + 1
-    labels = dense_to_one_hot(labels, num_classes)
-    ano_labels = np.squeeze(np.array(label))
 
+    if "Class" in data:
+        labels = np.squeeze(np.array(data["Class"], dtype=np.int64) - 1)
+        num_classes = np.max(labels) + 1
+        labels = dense_to_one_hot(labels, num_classes)
+    else:
+        labels = np.zeros((adj.shape[0], 1), dtype=np.float32)
+
+    ano_labels = np.squeeze(np.array(label))
     if "str_anomaly_label" in data:
         str_ano_labels = np.squeeze(np.array(data["str_anomaly_label"]))
         attr_ano_labels = np.squeeze(np.array(data["attr_anomaly_label"]))
@@ -91,32 +95,30 @@ def load_mat(dataset, train_rate=0.3, val_rate=0.1, data_dir="~/datasets/GAD/mat
     idx_train = all_idx[:num_train]
     idx_val = all_idx[num_train:num_train + num_val]
     idx_test = all_idx[num_train + num_val:]
-
     return adj, feat, labels, idx_train, idx_val, idx_test, ano_labels, str_ano_labels, attr_ano_labels
 
 
 def adj_to_edge_index(adj: sp.spmatrix, device: Optional[torch.device] = None) -> Tensor:
-    """Convert a scipy adjacency matrix to a PyG edge_index tensor.
-
-    This replaces the old DGLGraph conversion.  The returned tensor has shape
-    [2, num_edges] and is sorted by source node, which is required by the
-    CSR-style random-walk sampler below.
-    """
+    """Convert a scipy adjacency matrix to a PyG edge_index tensor sorted by source node."""
     coo = sp.coo_matrix(adj)
     row = torch.from_numpy(coo.row).long()
     col = torch.from_numpy(coo.col).long()
     edge_index = torch.stack([row, col], dim=0)
-
-    out = sort_edge_index(edge_index, num_nodes=coo.shape[0], sort_by_row=True)
-    edge_index = out[0] if isinstance(out, tuple) else out
-
+    if sort_edge_index is not None:
+        out = sort_edge_index(edge_index, num_nodes=coo.shape[0], sort_by_row=True)
+        edge_index = out[0] if isinstance(out, tuple) else out
+    else:
+        # Fallback when torch_geometric is unavailable: sort by source row, then destination col.
+        order = edge_index[0] * coo.shape[0] + edge_index[1]
+        perm = torch.argsort(order)
+        edge_index = edge_index[:, perm]
     if device is not None:
         edge_index = edge_index.to(device)
     return edge_index
 
 
-def _edge_index_to_csr(edge_index: Tensor, num_nodes: int) -> Tuple[Tensor, Tensor]:
-    """Build CSR row pointer and destination tensors from sorted edge_index."""
+def edge_index_to_csr(edge_index: Tensor, num_nodes: int) -> Tuple[Tensor, Tensor]:
+    """Build CSR row pointer and destination tensors once, then reuse them."""
     row, col = edge_index[0], edge_index[1]
     deg = torch.bincount(row, minlength=num_nodes)
     rowptr = torch.zeros(num_nodes + 1, dtype=torch.long, device=edge_index.device)
@@ -129,107 +131,63 @@ def _sample_next(rowptr: Tensor, col: Tensor, current: Tensor) -> Tensor:
     deg = rowptr[current + 1] - rowptr[current]
     has_neighbor = deg > 0
     nxt = current.clone()
-
     if has_neighbor.any():
         valid_current = current[has_neighbor]
         valid_deg = deg[has_neighbor]
         offset = torch.floor(torch.rand(valid_deg.numel(), device=current.device) * valid_deg.float()).long()
         nxt[has_neighbor] = col[rowptr[valid_current] + offset]
-
     return nxt
 
 
-def _pyg_rwr_trace(
+@torch.no_grad()
+def generate_rwr_subgraph_tensor(
     rowptr: Tensor,
     col: Tensor,
-    starts: Tensor,
-    walk_length: int,
-    restart_prob: float = 0.9,
+    num_nodes: int,
+    subgraph_size: int,
+    sample_multiplier: int = 4,
 ) -> Tensor:
-    """Generate random-walk-with-restart traces using PyTorch/PyG tensors.
+    """Fast CoLA-style local subgraph sampler.
 
-    Unlike DGL's deprecated contrib API, this implementation has no DGL or
-    torch-cluster dependency.  At every step, the walker first restarts to the
-    seed node with probability restart_prob, then samples a uniform outgoing
-    neighbor.  Isolated nodes stay at themselves.
+    The original code calls generate_rwr_subgraph every epoch/testing round. Its first pass uses
+    restart_prob=1.0, which is equivalent to repeatedly sampling direct neighbours of each center.
+    This implementation exploits that equivalence, builds CSR only once outside this function, and
+    returns a tensor [num_nodes, subgraph_size] directly on the target device.
+
+    Each row is [context nodes..., center]. When a node has too few unique neighbours, contexts are
+    padded by repeated sampled nodes or by the center itself, matching the fixed-size requirement.
     """
-    starts = starts.long()
-    current = starts.clone()
-    traces = torch.empty(
-        starts.numel(), walk_length + 1,
-        dtype=torch.long,
-        device=starts.device,
-    )
-    traces[:, 0] = starts
-
-    for step in range(1, walk_length + 1):
-        if restart_prob > 0:
-            mask = torch.rand(starts.numel(), device=starts.device) < restart_prob
-            current = torch.where(mask, starts, current)
-        current = _sample_next(rowptr, col, current)
-        traces[:, step] = current
-
-    return traces
-
-
-def _unique_context(trace: Tensor, center: int, reduced_size: int) -> List[int]:
-    """Keep unique nodes in sampled order and put the center node outside context."""
-    context: List[int] = []
-    seen = set()
-    for node in trace.detach().cpu().tolist():
-        node = int(node)
-        if node == center or node < 0 or node in seen:
-            continue
-        seen.add(node)
-        context.append(node)
-        if len(context) >= reduced_size:
-            break
-    return context
-
-
-def generate_rwr_subgraph(edge_index: Tensor, num_nodes: int, subgraph_size: int) -> List[List[int]]:
-    """Generate CoLA subgraphs with a PyG/PyTorch RWR sampler.
-
-    Return format is exactly what the original run.py expects:
-    each item has length subgraph_size, and the last element is the center node.
-    """
+    device = rowptr.device
     reduced_size = subgraph_size - 1
-    rowptr, col = _edge_index_to_csr(edge_index, num_nodes)
-    starts = torch.arange(num_nodes, device=edge_index.device)
+    starts = torch.arange(num_nodes, dtype=torch.long, device=device)
 
-    # First pass: high restart probability emphasizes the local neighborhood,
-    # matching the intent of CoLA's DGL RWR-based local subgraph sampling.
-    traces = _pyg_rwr_trace(
-        rowptr=rowptr,
-        col=col,
-        starts=starts,
-        walk_length=max(subgraph_size * 3, reduced_size),
-        restart_prob=1.0,
-    )
+    # 采样候选数略多于所需 context，减少低度节点重复导致的不足。
+    candidate_len = max(subgraph_size * sample_multiplier, reduced_size)
+    current = starts.repeat_interleave(candidate_len)
+    candidates = _sample_next(rowptr, col, current).view(num_nodes, candidate_len)
 
-    subgraphs: List[List[int]] = []
+    subgraphs = torch.empty((num_nodes, subgraph_size), dtype=torch.long, device=device)
+    # context 去重仍需逐节点处理，但只处理一个小矩阵，避免了原始实现中的多次 RWR 重试。
+    cand_cpu = candidates.detach().cpu().numpy()
+    out_cpu = np.empty((num_nodes, subgraph_size), dtype=np.int64)
     for i in range(num_nodes):
-        context = _unique_context(traces[i], i, reduced_size)
-        retry_time = 0
-
-        while len(context) < reduced_size and retry_time < 10:
-            retry_trace = _pyg_rwr_trace(
-                rowptr=rowptr,
-                col=col,
-                starts=torch.tensor([i], dtype=torch.long, device=edge_index.device),
-                walk_length=max(subgraph_size * 5, reduced_size),
-                restart_prob=0.9,
-            )[0]
-            context = _unique_context(retry_trace, i, reduced_size)
-            retry_time += 1
-
+        seen = set()
+        context = []
+        for node in cand_cpu[i]:
+            node = int(node)
+            if node == i or node in seen:
+                continue
+            seen.add(node)
+            context.append(node)
+            if len(context) == reduced_size:
+                break
         if len(context) < reduced_size:
-            if len(context) == 0:
+            if not context:
                 context = [i] * reduced_size
             else:
                 repeat = (reduced_size + len(context) - 1) // len(context)
                 context = (context * repeat)[:reduced_size]
-
-        subgraphs.append(context[:reduced_size] + [i])
-
+        out_cpu[i, :-1] = np.asarray(context[:reduced_size], dtype=np.int64)
+        out_cpu[i, -1] = i
+    subgraphs.copy_(torch.from_numpy(out_cpu).to(device))
     return subgraphs
