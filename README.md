@@ -5,7 +5,7 @@ This is the fork code of TNNLS paper [Anomaly Detection on Attributed Networks v
 ## Setup
 ```bash
 uv venv -p 3.12
-uv pip install torch==2.11.0 torch_geometric scikit-learn --torch-backend=cu128
+uv pip install torch==2.11.0 torch_geometric scikit-learn optuna pandas --torch-backend=cu128
 ```
 
 dataset_path: ~/datasets/GAD/mat

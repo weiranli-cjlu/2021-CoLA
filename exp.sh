@@ -1,0 +1,4 @@
+python run.py --dataset YelpChi --lr 0.00011592813265759698 --weight_decay 5.534412570792458e-05 --embedding_dim 32 --batch_size 256 --subgraph_size 3 --readout min --auc_test_rounds 256 --negsamp_ratio 1
+python run.py --dataset tolokers --lr 0.002815105595833478 --weight_decay 5.595986878006084e-06 --embedding_dim 64 --batch_size 256 --subgraph_size 4 --readout min --auc_test_rounds 256 --negsamp_ratio 1
+python run.py --dataset twitter --lr 0.002815105595833478 --weight_decay 5.595986878006084e-06 --embedding_dim 64 --batch_size 256 --subgraph_size 4 --readout min --auc_test_rounds 256 --negsamp_ratio 1
+python run.py --dataset book --lr 3.1882105359307654e-05 --weight_decay 0.00047607677518095016 --embedding_dim 128 --batch_size 128 --subgraph_size 3 --readout max --auc_test_rounds 256 --negsamp_ratio 1
