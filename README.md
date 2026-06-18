@@ -1,32 +1,16 @@
 # Anomaly Detection on Attributed Networks via Contrastive Self-Supervised Learning
 
-This is the source code of TNNLS paper [Anomaly Detection on Attributed Networks via Contrastive Self-Supervised Learning](https://arxiv.org/abs/2103.00113) (CoLA). 
+This is the fork code of TNNLS paper [Anomaly Detection on Attributed Networks via Contrastive Self-Supervised Learning](https://arxiv.org/abs/2103.00113) (CoLA). 
 
-![The proposed framework](framework.png)
+## Setup
+```bash
+uv venv -p 3.12
+uv pip install torch==2.11.0 torch_geometric scikit-learn --torch-backend=cu128
+```
 
-
-## Requirments
-This code requires the following:
-* Python>=3.7
-* PyTorch>=1.8.1
-* Numpy>=1.19.2
-* Scipy>=1.6.2
-* Scikit-learn>=0.24.1
-* Networkx>=2.5.1
-* Tqdm>=4.59.0
-* DGL==0.4.0 (Do not use the version which is newer than that!)
+dataset_path: ~/datasets/GAD/mat
 
 ## Running the experiments
-### Step 1: Anomaly Injection
-This is a pre-processing step which injects anomalies into the original clean datasets. Take Cora dataset as an example:
-```
-python inject_anomaly.py --dataset cora
-```
-
-After anomaly injection, the disturbed datasets are saved into "dataset" folder.
-
-Note that the disturbed ACM dataset is directly borrowed from the code of [DOMINANT](https://github.com/kaize0409/GCN_AnomalyDetection) and do not need injection. 
-
 ### Step 2: Anomaly Detection
 This step is to run the CoLA framework to detect anomalies in the network datasets. Take Cora dataset as an example:
 ```
